@@ -2,7 +2,7 @@
 """Check the security headers of a captured HTTP response and grade them.
 
 Input: the raw response as saved from `curl -sI https://example.com > resp.txt` or `curl -si` (status line and
-headers; a body is ignored), or a JSON object of header names to values. Nothing is fetched by this script.
+headers; a body is ignored), a JSON object of header names to values, or a HAR file export from browser devtools. Nothing is fetched by this script.
 
 Checks (id, severity):
   HDR-001 high      Strict-Transport-Security missing, max-age under one year, or no includeSubDomains (HTTPS responses)
@@ -23,7 +23,7 @@ Checks (id, severity):
 Grade: A no findings above low, B one medium, C several medium, D any high, F any critical.
 
 Usage:
-    headers_check.py FILE [--json] [--http] [--sensitive] [--fail-on SEVERITY]      (FILE: raw response or headers JSON; '-' stdin)
+    headers_check.py FILE [--json] [--url URL] [--http] [--sensitive] [--fail-on SEVERITY]      (FILE: raw response, headers JSON, or HAR; '-' stdin)
 
 Exit codes: 0 nothing at or above --fail-on (default: high), 1 otherwise, 2 unreadable input.
 Standard library only. Read-only. No network.
@@ -48,29 +48,48 @@ def parse_response(text: str, target_url: str | None = None) -> tuple[dict[str, 
         doc = json.loads(stripped)
         if "log" in doc and isinstance(doc["log"], dict) and isinstance(doc["log"].get("entries"), list):
             entries = doc["log"]["entries"]
+            if not entries:
+                raise ValueError("empty entries list in HAR")
             entry = None
             if target_url:
                 for e in entries:
-                    if e.get("request", {}).get("url") == target_url:
+                    if isinstance(e, dict) and (e.get("request") or {}).get("url") == target_url:
                         entry = e
                         break
+                if not entry:
+                    raise ValueError(f"no HAR entry with request.url == {target_url}")
             else:
                 for e in entries:
-                    mime = e.get("response", {}).get("content", {}).get("mimeType", "")
-                    if mime.startswith("text/html"):
-                        entry = e
-                        break
+                    if isinstance(e, dict):
+                        mime = ((e.get("response") or {}).get("content") or {}).get("mimeType", "")
+                        if isinstance(mime, str) and mime.startswith("text/html"):
+                            entry = e
+                            break
                 if not entry and entries:
-                    entry = entries[0]
-            
+                    entry = entries[0] if isinstance(entries[0], dict) else None
+
             if entry:
-                resp = entry.get("response", {})
+                resp = entry.get("response") or {}
                 headers: dict[str, list[str]] = {}
-                for h in resp.get("headers", []):
-                    headers.setdefault(h.get("name", "").strip().lower(), []).append(h.get("value", "").strip())
-                http_version = str(resp.get("httpVersion", ""))
-                http_v = http_version if http_version.upper().startswith("HTTP/") else f"HTTP/{http_version}"
-                status = f"{http_v} {resp.get('status', '')} {resp.get('statusText', '')}".strip()
+                raw_headers = resp.get("headers")
+                if raw_headers is None:
+                    raw_headers = []
+                for h in raw_headers:
+                    if isinstance(h, dict):
+                        name = str(h.get("name") or "").strip().lower()
+                        val = str(h.get("value") or "").strip()
+                        if name:
+                            headers.setdefault(name, []).append(val)
+                raw_ver = str(resp.get("httpVersion") or "").strip()
+                if raw_ver.lower().startswith("http/"):
+                    http_v = "HTTP/" + raw_ver[5:]
+                elif raw_ver:
+                    http_v = f"HTTP/{raw_ver}"
+                else:
+                    http_v = "HTTP/1.1"
+                status_code = resp.get("status", "")
+                status_text = resp.get("statusText", "")
+                status = f"{http_v} {status_code} {status_text}".strip()
                 return headers, status
             return {}, None
 
@@ -221,6 +240,9 @@ def main(argv: list[str] | None = None) -> int:
         headers, status = parse_response(text, args.url)
     except (OSError, json.JSONDecodeError) as exc:
         print(f"error: cannot read response: {exc}", file=sys.stderr)
+        return 2
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
         return 2
     if not headers:
         print("error: no headers found (expected 'Name: value' lines or a JSON object)", file=sys.stderr)
